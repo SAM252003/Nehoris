@@ -1,0 +1,3 @@
+company,prompt,model,run,answer_preview
+seven seventy,Best kosher pizza in Charenton-le-Pont,llama3.2:1b-instruct-fp16,1,Réponse pour prompt #1 (run 1)
+seven seventy,meilleur pizza casher Charenton,llama3.2:1b-instruct-fp16,1,Réponse pour prompt #2 (run 1)

@@ -1,0 +1,30 @@
+brand:
+  name: "Imprimerie Dupont"
+  variants: [ "Imprimerie Dupont", "Dupont Imprimerie", "dupont-imprimerie.fr" ]
+  competitors: [ "CopyFast", "ImprimeurX", "Paris Print" ]
+
+campaign:
+  models: [
+    "perplexity:sonar", # <-- web-grounded (recherche Internet)
+    # "ollama:llama3.1", # <-- local/closed-book (optionnel)
+  ]
+  runs_per_query: 1
+  temperature: 0.1
+  appear_lead_chars: 300
+  locale: fr_FR
+  queries_file: "data/queries/printing_paris.fr.csv"
+
+  io:
+  out_dir: "data/outputs"
+
+
+campaign:
+  models: [ "openai:gpt-4o-mini" ]
+  runs_per_query: 3
+  temperature: 0.2
+  appear_lead_chars: 300
+  locale: fr_FR
+  queries_file: "data/queries/printing_paris.fr.csv"
+
+  io:
+  out_dir: "data/outputs"

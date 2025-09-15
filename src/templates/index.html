@@ -1,0 +1,137 @@
+<!-- src/templates/index.html -->
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>GEO — Lancer une campagne</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; }
+    label { display:block; margin:.6rem 0 .2rem; font-weight:600 }
+    textarea, input, select, button { font-size: 16px; padding:.4rem; }
+    .row { display:flex; gap:1rem; align-items: center; }
+    .exports { margin-top:2rem; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border:1px solid #ddd; padding:.4rem; text-align:left; }
+  </style>
+</head>
+<body>
+  <h1>GEO — Lancer une campagne</h1>
+
+  <form id="form-campaign">
+    <label>Nom de la société</label>
+    <input id="company" placeholder="Seven seventy" required />
+
+    <label>Variantes (séparées par des virgules)</label>
+    <input id="variants" placeholder="seven sevety, sevensevent" />
+
+    <label>Concurrents (optionnel)</label>
+    <input id="competitors" placeholder="Domino's, Pizza Hut" />
+
+    <label>Prompts (un par ligne)</label>
+    <textarea id="prompts" rows="4" placeholder="best kosher pizza in Charenton le pont"></textarea>
+
+    <label>Modèle</label>
+    <select id="model">
+      <option value="llama3.2:1b-instruct-fp16">Llama (local)</option>
+    </select>
+
+    <div class="row">
+      <label>Runs par prompt</label>
+      <input id="runs" type="number" min="1" max="2" value="1" style="width:80px" />
+      <button type="submit">Lancer</button>
+    </div>
+  </form>
+
+  <div class="exports">
+    <h2>Exports</h2>
+    <div id="exports-list"></div>
+    <h3>Aperçu (CSV)</h3>
+    <div id="preview"></div>
+  </div>
+
+  <script>
+    const MAX_PROMPTS = 20;
+    const MAX_RUNS = 2;
+    const MAX_EST_MB = 500;  // même valeur que backend
+    function estimateMB(prompts, runs, per=5) { return prompts * runs * per; }
+
+    // ---- Valider et envoyer la campagne ----
+    document.getElementById("form-campaign").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const company = document.getElementById("company").value.trim();
+      const variants = (document.getElementById("variants").value || "")
+        .split(",").map(s=>s.trim()).filter(Boolean);
+      const competitors = (document.getElementById("competitors").value || "")
+        .split(",").map(s=>s.trim()).filter(Boolean);
+      const prompts = (document.getElementById("prompts").value || "")
+        .split("\n").map(s=>s.trim()).filter(Boolean);
+      const runs = parseInt(document.getElementById("runs").value || "1", 10);
+      const model = document.getElementById("model").value;
+
+      if (!company) return alert("Nom de la société requis.");
+      if (prompts.length === 0) return alert("Ajoute au moins 1 prompt.");
+      if (prompts.length > MAX_PROMPTS) return alert(`Trop de prompts (${prompts.length}). Max: ${MAX_PROMPTS}.`);
+      if (runs < 1 || runs > MAX_RUNS) return alert(`Runs par prompt invalide (${runs}). Max: ${MAX_RUNS}.`);
+      const est = estimateMB(prompts.length, runs);
+      if (est > MAX_EST_MB) return alert(`Campagne estimée ≈ ${Math.round(est)} MB > ${MAX_EST_MB} MB.`);
+
+      try {
+        const res = await fetch("/api/campaigns/run", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ company, variants, competitors, prompts, runs, model })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Erreur inconnue");
+        alert(`OK: ${data.prompts} prompts × ${data.runs} run(s).\nExport: ${data.summary}`);
+        loadExports(); // rafraîchir la liste
+      } catch (err) {
+        alert("Erreur: " + err.message);
+      }
+    });
+
+    // ---- Liste des exports (au démarrage) ----
+    async function loadExports() {
+      const box = document.getElementById("exports-list");
+      const prev = document.getElementById("preview");
+      prev.innerHTML = "";
+      try {
+        const res = await fetch("/api/exports/list");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Erreur liste exports");
+        if (!data.items.length) { box.innerHTML = "<i>Aucun export pour le moment.</i>"; return; }
+        box.innerHTML = `<ul>${
+          data.items.map(it =>
+            `<li><button data-name="${it.name}" class="btn-prev">Aperçu</button> ${it.name} — ${it.size_mb} MB</li>`
+          ).join("")
+        }</ul>`;
+        box.querySelectorAll(".btn-prev").forEach(btn => {
+          btn.addEventListener("click", () => previewExport(btn.dataset.name));
+        });
+      } catch (e) {
+        box.innerHTML = `<span style="color:#b00">Erreur de chargement: ${e.message}</span>`;
+      }
+    }
+
+    // ---- Aperçu CSV (50 lignes max) ----
+    async function previewExport(name) {
+      const prev = document.getElementById("preview");
+      prev.innerHTML = "Chargement…";
+      try {
+        const res = await fetch(`/api/exports/preview?name=${encodeURIComponent(name)}&limit=50`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Erreur d’aperçu");
+        const head = `<tr>${data.columns.map(c=>`<th>${c}</th>`).join("")}</tr>`;
+        const rows = data.rows.map(r => `<tr>${data.columns.map(c => `<td>${(r[c]??"")}</td>`).join("")}</tr>`).join("");
+        prev.innerHTML = `<p><b>${name}</b> — ${data.rows.length} lignes</p><table>${head}${rows}</table>`;
+      } catch (e) {
+        prev.innerHTML = `<span style="color:#b00">Erreur: ${e.message}</span>`;
+      }
+    }
+
+    // au démarrage: on ne charge PAS d’export volumineux → seulement la liste
+    loadExports();
+  </script>
+</body>
+</html>
