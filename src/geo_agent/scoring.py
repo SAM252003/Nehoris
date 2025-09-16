@@ -43,3 +43,26 @@ def share_of_voice(rows: List[Dict[str, Any]]):
         "competitors": comp_totals,
         "SOV": round(sov, 4),
     }
+
+# --- GEO brand scoring helpers ---
+from typing import List, Dict, Any
+from src.geo_agent.brand.brand_models import BrandMatch
+
+def summarize_brand_matches(matches: List[BrandMatch]) -> Dict[str, Any]:
+    """
+    Regroupe les matches par marque :
+    - total, exact, fuzzy
+    - first_mention_index (indice du 1er hit)
+    """
+    summary: Dict[str, Any] = {}
+    for m in matches:
+        s = summary.setdefault(m.brand, {"total": 0, "exact": 0, "fuzzy": 0, "first_mention_index": None})
+        s["total"] += 1
+        if m.method == "exact":
+            s["exact"] += 1
+        elif m.method == "fuzzy":
+            s["fuzzy"] += 1
+        # met à jour la première position si plus tôt
+        if s["first_mention_index"] is None or (isinstance(m.start, int) and m.start < s["first_mention_index"]):
+            s["first_mention_index"] = m.start
+    return summary
