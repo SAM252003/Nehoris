@@ -64,3 +64,13 @@ __pycache__/
 *.pyo
 *.pyd
 *.sqlite3
+
+
+# --- Local data ---
+gegit rm -r --cached geo.dbo.db
+geo.db
+*.sqlite3
+data/**/*.csv
+data/**/*.jsonl
+data/**/*.parquet
+logs/
