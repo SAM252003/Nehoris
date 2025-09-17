@@ -9,7 +9,7 @@ dev: install
 
 # Lance le backend FastAPI en dev
 run:
-	. .venv/bin/activate && uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000
+	. .venv/bin/activate && PYTHONPATH=src uvicorn backend.app:app --reload --host 0.0.0.0 --port 8000
 
 # Tests (pytest)
 test:

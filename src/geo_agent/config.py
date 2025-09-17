@@ -1,26 +1,32 @@
 # src/geo_agent/config.py
 from __future__ import annotations
-from typing import Optional
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
+from dataclasses import dataclass
+from dotenv import load_dotenv
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",   # ✅ important: ignore les variables non définies
-    )
+# Charger le .env depuis la racine du projet
+load_dotenv()
 
-    ollama_host: str = Field(default="http://localhost:11434")
-    ollama_timeout: int = Field(default=180)
-    pplx_api_key: Optional[str] = None
-    openai_api_key: Optional[str] = None
+@dataclass(frozen=True)
+class Settings:
+    # Provider/model par défaut (agnostique)
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "llama3.2:1b-instruct-fp16")
+    TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.2"))
+    LLM_TIMEOUT_S: float = float(os.getenv("LLM_TIMEOUT_S", "60"))
 
-    def describe(self) -> dict:
-        return {
-            "ollama_host": self.ollama_host,
-            "ollama_timeout": self.ollama_timeout,
-            "has_pplx": bool(self.pplx_api_key),
-            "has_openai": bool(self.openai_api_key),
-        }
+    # OpenAI
+    OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
+    OPENAI_BASE_URL: str | None = os.getenv("OPENAI_BASE_URL")  # ex: https://api.openai.com/v1
+
+    # (optionnel) HuggingFace
+    HF_API_KEY: str | None = os.getenv("HF_API_KEY")
+    HF_MODEL: str | None = os.getenv("HF_MODEL")
+
+    # (optionnel) Anthropic / Perplexity / Gemini
+    ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")
+    PPLX_API_KEY: str | None = os.getenv("PPLX_API_KEY")
+    GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")
+    GOOGLE_API_KEY: str | None = os.getenv("GOOGLE_API_KEY")
+
+settings = Settings()

@@ -11,270 +11,176 @@ Usage (ex. sans RQ) :
     from backend.workers.tasks import run_campaign_async
     run_campaign_async(42)
 """
-
+# backend/workers/tasks.py
 from __future__ import annotations
-import os
-import sys
-from typing import List, Dict, Any
-from urllib.parse import urlparse
 
-from sqlmodel import Session, select
-from src.geo_agent.models.ollama_client import OllamaClient
-from src.geo_agent.config import Settings
+import asyncio
+from collections import defaultdict
+from typing import Dict, List, Optional
 
-cfg = Settings()
-client = OllamaClient(model="llama3.1", host=cfg.ollama_host, timeout=cfg.ollama_timeout)
+from sqlalchemy.orm import Session
 
+from ..db import get_session
+from ..models import Campaign, CampaignPrompt, Run, RunResponse, Company
+from ..utils.progress import publish_progress
+from ..services.mentions import extract_mentions  # ta détection fuzzy existante
 
-# S'assurer que le répertoire projet (parent) est dans sys.path
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if BASE_DIR not in sys.path:
-    sys.path.append(BASE_DIR)
-
-# DB & modèles
-from backend.db import engine
-from backend.models import Company, Campaign, CampaignPrompt, Prompt, Run
-
-# Progression SSE
-from backend.utils.progress import publish
-
-# Analyse (nouvelle implémentation fournie dans src/geo_agent/extracts.py)
-from src.geo_agent.extracts import MentionDetector
-from src.geo_agent.parse_ranked import parse_ranked as parse_ranked_list
-
-# HTTP
-import json
-import time
-import requests
+from geo_agent.models import get_llm_client
+from geo_agent.config import settings
 
 
-# ------------------------- Clients LLM (minimaux) -------------------------
-
-class _PerplexityClient:
-    """
-    Client minimal Perplexity (web-grounded).
-    Nécessite PPLX_API_KEY. Route: POST /chat/completions
-    """
-    def __init__(self, model: str = "sonar"):
-        self.model = model
-        self.base = os.getenv("PPLX_BASE_URL", "https://api.perplexity.ai")
-        self.key = os.getenv("PPLX_API_KEY")
-        if not self.key:
-            raise RuntimeError("PPLX_API_KEY manquant (Perplexity)")
-
-    def answer_with_meta(self, messages: List[Dict[str, str]], temperature: float = 0.1) -> Dict[str, Any]:
-        url = f"{self.base}/chat/completions"
-        r = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"},
-            json={"model": self.model, "messages": messages, "temperature": float(temperature)},
-            timeout=180,
-        )
-        r.raise_for_status()
-        data = r.json()
-        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-        # Perplexity peut renvoyer "citations" ou "references"
-        sources = data.get("citations") or data.get("references") or []
-        return {"text": text, "sources": sources}
-
-
-class _OllamaClient:
-    """
-    Client minimal Ollama (local).
-    Démarrer Ollama puis `ollama pull llama3.1` par exemple.
-    """
-    def __init__(self, model: str = "llama3.1"):
-        self.model = model
-        self.base = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-
-    def answer_with_meta(self, messages: List[Dict[str, str]], temperature: float = 0.1) -> Dict[str, Any]:
-        url = f"{self.base}/api/chat"
-        r = requests.post(
-            url,
-            json={"model": self.model, "messages": messages, "options": {"temperature": float(temperature)}, "stream": False},
-            timeout=180,
-        )
-        r.raise_for_status()
-        data = r.json()
-        text = (data.get("message") or {}).get("content", "") or ""
-        return {"text": text, "sources": []}
-
-
-class _OpenAIClient:
-    """
-    Client minimal OpenAI (Chat Completions).
-    Nécessite OPENAI_API_KEY. Utilise model="gpt-5" par défaut si choisi.
-    """
-    def __init__(self, model: str = "gpt-5"):
-        self.model = model
-        self.key = os.getenv("OPENAI_API_KEY")
-        if not self.key:
-            raise RuntimeError("OPENAI_API_KEY manquant")
-        # API v1 simple via HTTP (évite dépendance forte)
-        self.base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-
-    def answer_with_meta(self, messages: List[Dict[str, str]], temperature: float = 0.1) -> Dict[str, Any]:
-        url = f"{self.base}/chat/completions"
-        r = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"},
-            json={"model": self.model, "messages": messages, "temperature": float(temperature)},
-            timeout=180,
-        )
-        r.raise_for_status()
-        data = r.json()
-        text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-        return {"text": text, "sources": []}
-
-
-def _make_client(model_spec: str):
-    """
-    model_spec format: "provider:model"  ex: "perplexity:sonar", "ollama:llama3.1", "openai:gpt-5"
-    """
-    prov, model = model_spec.split(":", 1)
-    if prov == "perplexity":
-        return _PerplexityClient(model)
-    if prov == "ollama":
-        return _OllamaClient(model)
-    if prov == "openai":
-        return _OpenAIClient(model)
-    raise ValueError(f"Fournisseur non supporté: {prov}")
-
-
-# ------------------------- Utilitaires -------------------------
-
-_SYSTEM_PROMPT = (
-    "Tu es un assistant qui répond avec des listes claires et sourcées quand c'est possible. "
-    "Quand la requête demande des recommandations / top listes, structure la réponse en éléments numérotés."
-)
-
-def _build_messages(query: str) -> List[Dict[str, str]]:
-    return [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": query},
-    ]
-
-
-def _normalize_sources(sources: Any) -> List[str]:
-    out: List[str] = []
-    if not sources:
-        return out
-    if isinstance(sources, str):
+# ---------- Helpers LLM ----------
+async def _call_llm_safe(prompt: str, model: Optional[str], temperature: float, retries: int) -> str:
+    client = get_llm_client()  # choisi via env: LLM_PROVIDER=ollama|openai|...
+    last_err: Optional[Exception] = None
+    for _ in range(max(retries, 0) + 1):
         try:
-            sources = json.loads(sources)
-        except Exception:
-            sources = [sources]
-    for s in sources:
-        try:
-            u = urlparse(s)
-            host = u.netloc or str(s)
-            if host:
-                out.append(host.lower())
-        except Exception:
-            out.append(str(s))
-    return out
+            return await client.complete(
+                prompt,
+                model=model or settings.LLM_MODEL,
+                temperature=temperature,
+            )
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.8)
+    # Si toutes les tentatives échouent
+    raise last_err if last_err else RuntimeError("LLM call failed")
 
-
-def _notify_progress(campaign_id: int, status: str, done: int, total: int) -> None:
-    payload = {"campaign_id": campaign_id, "status": status, "completed_runs": done, "total_runs": total,
-               "pct": round((done / total * 100) if total else 0.0, 1)}
-    # publier même hors boucle async
-    try:
-        import asyncio
-        asyncio.run(publish(campaign_id, payload))
-    except RuntimeError:
-        # si une boucle existe déjà
-        try:
-            import asyncio
-            asyncio.get_event_loop().create_task(publish(campaign_id, payload))
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-# ------------------------- Tâche principale -------------------------
 
 def run_campaign_async(campaign_id: int) -> None:
-    """
-    Exécute tous les runs de la campagne en base, met à jour la progression
-    et persiste chaque réponse dans Run.
-    """
-    with Session(engine) as session:
-        camp = session.get(Campaign, campaign_id)
+    asyncio.run(_run_campaign(campaign_id))
+
+
+# ---------- Orchestrateur principal ----------
+async def _run_campaign(campaign_id: int) -> None:
+    with get_session() as session:
+        camp: Optional[Campaign] = session.query(Campaign).get(campaign_id)  # type: ignore
         if not camp:
             return
-        comp = session.get(Company, camp.company_id)
-        if not comp:
-            return
-
-        cps = session.exec(
-            select(CampaignPrompt).where(CampaignPrompt.campaign_id == campaign_id).order_by(CampaignPrompt.order_index)
-        ).all()
-        # protéger si pas de prompts
-        if not cps:
-            camp.status = "error"
-            session.add(camp)
-            session.commit()
-            _notify_progress(campaign_id, camp.status, 0, 0)
-            return
-
-        client = _make_client(camp.model)
-        det = MentionDetector(comp.variants, comp.competitors, lead_chars=300)
-
-        # Dictionnaire {variant_normalisée: canon} pour parser classement
-        brand_map = det.build_brand_map()
-
-        total_runs = len(cps) * max(1, int(camp.runs_per_query or 1))
-        done = 0
 
         camp.status = "running"
-        session.add(camp)
         session.commit()
-        _notify_progress(campaign_id, camp.status, done, total_runs)
 
-        for cp in cps:
-            pr: Prompt | None = session.get(Prompt, cp.prompt_id)
-            if not pr:
-                continue
-            for run_idx in range(camp.runs_per_query or 1):
-                # Appel modèle
-                meta = client.answer_with_meta(_build_messages(pr.text), temperature=float(camp.temperature or 0.1))
-                text: str = meta.get("text", "") or ""
-                sources = _normalize_sources(meta.get("sources", []))
+        prompts: List[CampaignPrompt] = (
+            session.query(CampaignPrompt).filter_by(campaign_id=campaign_id).all()
+        )
+        total_runs = sum(camp.runs_per_prompt for _ in prompts)
+        completed = 0
 
-                # Analyse
-                stats = det.analyze(text)
-                rankings = parse_ranked_list(text, brand_map)
+        # Prépare les marques (principale + concurrents)
+        brands_map = _companies_map(session, camp.company_id)  # {"ACME":[...], "Globex":[...]}
+        primary = _primary_brand(session, camp.company_id)     # "ACME"
 
-                # Persist
-                row = Run(
-                    campaign_id=camp.id,            # type: ignore
-                    prompt_id=cp.prompt_id,
-                    run_index=run_idx,
-                    model=camp.model,
-                    text=text,
-                    appear_answer=stats.appear_answer,
-                    appear_lead=stats.appear_lead,
-                    first_pos=stats.first_pos,
-                    brand_hits=stats.brand_hits,
-                    comp_hits=stats.comp_hits,
-                    sources=sources,
-                    rankings=rankings,
-                )
-                session.add(row)
+        run_level_vis: List[Dict[str, float]] = []
 
-                # progression
-                done += 1
-                camp.completed_runs = done
-                session.add(camp)
+        for p in prompts:
+            for i in range(camp.runs_per_prompt):
+                # 1) Trace du run
+                run = Run(campaign_id=camp.id, prompt_id=p.id, idx=i, status="running")
+                session.add(run)
                 session.commit()
-                _notify_progress(campaign_id, camp.status, done, total_runs)
 
-                # mini pause anti-throttle (facultatif)
-                time.sleep(0.1)
+                # 2) Appel LLM
+                text = await _call_llm_safe(
+                    p.text,
+                    model=(camp.model or settings.LLM_MODEL),
+                    temperature=(camp.temperature or settings.TEMPERATURE),
+                    retries=settings.LLM_MAX_RETRIES,
+                )
+
+                # 3) Stocke la réponse brute
+                session.add(RunResponse(run_id=run.id, raw_text=text))
+
+                # 4) Détection de marques (fuzzy) -> compteur par marque
+                hits = extract_mentions(text, brands_map, threshold=85)
+                counter: Dict[str, int] = {b: 0 for b in brands_map.keys()}
+                for brand, _score in hits:
+                    counter[brand] = counter.get(brand, 0) + 1
+
+                # 5) Visibilité pour CE run (dict brand -> ratio 0..1)
+                rv = _run_visibility(counter)
+                run_level_vis.append(rv)
+
+                # 6) Progress SSE (live % pour la marque principale)
+                completed += 1
+                publish_progress(campaign_id, {
+                    "type": "progress",
+                    "completed": completed,
+                    "total": total_runs,
+                    "visibility_running_pct": round(100.0 * float(rv.get(primary, 0.0)), 1),
+                    "last_run_visibility": {k: float(v) for k, v in rv.items()},
+                })
+
+                run.status = "done"
+                session.commit()
+
+        # 7) Visibilité finale de campagne (moyenne des parts par run)
+        final_visibility = _campaign_visibility(run_level_vis)  # {"ACME":0.58,"Globex":0.42}
 
         camp.status = "done"
-        session.add(camp)
         session.commit()
-        _notify_progress(campaign_id, camp.status, done, total_runs)
+
+        # 8) Event final SSE — clés simples pour le front
+        primary_ratio = float(final_visibility.get(primary, 0.0))
+        publish_progress(campaign_id, {
+            "type": "done",
+            "completed": completed,
+            "total": total_runs,
+
+            # --- clefs faciles à consommer côté front ---
+            "visibility_ratio": primary_ratio,                          # 0..1 (marque principale)
+            "visibility_pct": round(100.0 * primary_ratio, 1),          # 0..100
+            "visibility": round(100.0 * primary_ratio, 1),              # rétro-compat éventuelle
+            "visibility_breakdown": {k: float(v) for k, v in final_visibility.items()},  # toutes marques
+        })
+
+
+# ---------- Utilitaires locaux (marques & agrégations) ----------
+def _companies_map(session: Session, company_id: int) -> Dict[str, List[str]]:
+    """
+    Construit la map des marques -> variantes pour le fuzzy.
+    """
+    c: Company = session.query(Company).get(company_id)  # type: ignore
+    brands: Dict[str, List[str]] = {c.name: (c.variants or [])}
+    for comp in (c.competitors or []):
+        # concurrents: au minimum eux-mêmes comme variante
+        brands.setdefault(comp, [comp])
+    return brands
+
+
+def _primary_brand(session: Session, company_id: int) -> str:
+    c: Company = session.query(Company).get(company_id)  # type: ignore
+    return c.name
+
+
+def _run_visibility(counter: Dict[str, int]) -> Dict[str, float]:
+    """
+    Convertit un compteur de mentions en parts relatives (somme <= 1).
+    """
+    total = sum(counter.values())
+    if total <= 0:
+        return {b: 0.0 for b in counter.keys()}
+    return {b: (v / total) for b, v in counter.items()}
+
+
+def _campaign_visibility(rows: List[Dict[str, float]]) -> Dict[str, float]:
+    """
+    Agrège la visibilité campagne comme moyenne des parts par run.
+    """
+    if not rows:
+        return {}
+    agg = defaultdict(float)
+    for rv in rows:
+        for b, p in rv.items():
+            agg[b] += p
+    n = float(len(rows))
+    return {b: (v / n) for b, v in agg.items()}
+
+def run_campaign_async(campaign_id: int) -> None:
+    try:
+        asyncio.run(_run_campaign(campaign_id))
+    except Exception as e:
+        # Publie un event d’erreur pour l’UI
+        from ..utils.progress import publish_progress
+        publish_progress(campaign_id, {"type": "error", "message": str(e)})
+        # (optionnel) log + mettre status=failed
