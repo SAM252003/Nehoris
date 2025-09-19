@@ -1,0 +1,15 @@
+{
+  "provider": "openai",
+  "model": "gpt-4o-mini",
+  "prompts": [
+    "Liste des meilleurs restaurants à Paris",
+    "Restaurants recommandés à Lyon",
+    "Top 5 restaurants à Marseille"
+  ],
+  "brands": [
+    {"name": "McDonald", "aliases": ["McDo", "McDonald's"]},
+    {"name": "Burger King", "aliases": ["BK"]},
+    {"name": "KFC", "aliases": ["Kentucky Fried Chicken"]}
+  ],
+  "temperature": 0.2
+}

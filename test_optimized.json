@@ -1,0 +1,14 @@
+{
+  "provider": "openai",
+  "model": "gpt-5",
+  "prompts": [
+    "Liste complète des cabinets comptables à Paris avec adresses et contacts",
+    "Répertoire détaillé des experts-comptables à Paris : noms, téléphones, spécialités"
+  ],
+  "brands": [
+    {"name": "Deloitte", "aliases": ["Deloitte & Touche"]},
+    {"name": "PwC", "aliases": ["PricewaterhouseCoopers"]},
+    {"name": "EY", "aliases": ["Ernst & Young"]}
+  ],
+  "temperature": 0.7
+}
