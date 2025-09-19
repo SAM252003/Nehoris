@@ -25,38 +25,76 @@ class OpenAIClient:
     ) -> str:
         """
         Compatible avec l'interface commune: retourne juste le texte
-        Supporte GPT-5 avec recherche web
+        Supporte GPT-5 avec API Responses et Chat Completions
         """
         used_model = model or self.model
 
-        # Si c'est GPT-5 et web_search activé, utilise la nouvelle API responses
-        if used_model.startswith("gpt-5") and web_search:
+        # Pour GPT-5, utilise l'API Responses pour de meilleures performances
+        if used_model.startswith("gpt-5"):
             if isinstance(messages, str):
                 input_text = messages
             else:
                 # Convertit les messages en input text pour l'API responses
-                input_text = "\n".join([msg.get("content", "") for msg in messages])
+                input_text = "\n".join([msg.get("content", "") for msg in messages if msg.get("content")])
 
-            resp = self.client.responses.create(
-                model=used_model,
-                input=input_text,
-                tools=[{"type": "web_search"}],
-                reasoning={"effort": "low"},
-                text={"verbosity": "medium"},
-                **kwargs
-            )
-            return resp.output_text or ""
+            # Map temperature vers reasoning effort
+            if temperature <= 0.3:
+                effort = "minimal"
+            elif temperature <= 0.5:
+                effort = "low"
+            elif temperature <= 0.8:
+                effort = "medium"
+            else:
+                effort = "high"
 
-        # Sinon utilise l'API chat standard
+            # Map temperature vers text verbosity
+            if temperature <= 0.3:
+                verbosity = "low"
+            elif temperature <= 0.7:
+                verbosity = "medium"
+            else:
+                verbosity = "high"
+
+            try:
+                # Prépare les paramètres pour l'API Responses
+                resp_params = {
+                    "model": used_model,
+                    "input": input_text,
+                    "reasoning": {"effort": effort},
+                    "text": {"verbosity": verbosity},
+                }
+
+                # Ajoute web_search si demandé
+                if web_search:
+                    resp_params["tools"] = [{"type": "web_search"}]
+
+                resp = self.client.responses.create(**resp_params)
+                return resp.output_text or ""
+            except Exception as e:
+                print(f"⚠️ Échec API Responses pour {used_model}, fallback vers Chat Completions: {e}")
+                # Fallback vers Chat Completions si l'API Responses échoue
+                pass
+
+        # API Chat Completions (standard ou fallback)
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
 
-        resp = self.client.chat.completions.create(
-            model=used_model,
-            messages=messages,
-            temperature=temperature,
-            **kwargs
-        )
+        # Gestion spéciale pour les modèles o1 (pas de temperature)
+        if "o1" in used_model.lower():
+            kwargs_filtered = {k: v for k, v in kwargs.items() if k != 'temperature'}
+            resp = self.client.chat.completions.create(
+                model=used_model,
+                messages=messages,
+                **kwargs_filtered
+            )
+        else:
+            # Pour les autres modèles, utilise temperature normalement
+            resp = self.client.chat.completions.create(
+                model=used_model,
+                messages=messages,
+                temperature=temperature,
+                **kwargs
+            )
         return resp.choices[0].message.content or ""
 
     def answer_with_meta(

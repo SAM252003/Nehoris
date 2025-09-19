@@ -32,6 +32,10 @@ app.include_router(prompts.router)
 app.include_router(campaigns.router)
 app.include_router(exports.router)
 
+# WebSocket routes pour streaming
+from backend import websocket_routes
+app.include_router(websocket_routes.router)
+
 @app.on_event("startup")
 def _startup():
     init_db()

@@ -6,6 +6,13 @@ from statistics import mean, median
 from fastapi import APIRouter, HTTPException, Body
 from pydantic import BaseModel
 
+# Cache pour les performances
+from backend.cache import cached, cache
+
+# Streaming pour les WebSockets
+from backend.streaming import manager, stream_audit_progress, create_progress_update
+
+
 # --- Détection de marques (depuis src.geo_agent) ---
 from src.geo_agent.brand.brand_models import Brand, BrandMatch
 from src.geo_agent.brand.detector import detect
@@ -72,6 +79,7 @@ def _apply_match_mode(matches: List[BrandMatch], mode: str) -> List[BrandMatch]:
         return [m for m in matches if m.method == "exact"]
     return matches
 
+@cached(ttl=1800, key_prefix="llm")  # Cache 30 minutes pour les réponses LLM
 def _ask_llm(provider: str, model: Optional[str], temperature: float, prompt: str) -> tuple[str, str]:
     """Appelle le LLM choisi et retourne (texte, modèle_utilisé). Supporte GPT-5 avec web search."""
     used_model = model or ("gpt-5-mini" if provider == "openai" else "llama3.2:3b-instruct-q4_K_M")
@@ -85,7 +93,7 @@ def _ask_llm(provider: str, model: Optional[str], temperature: float, prompt: st
             res = client.answer([{"role": "user", "content": prompt}], model=used_model, temperature=temperature)
             text = res if isinstance(res, str) else getattr(res, "text", "")
         else:
-            text = client.answer(prompt, temperature=temperature)
+            text = client.answer(prompt, model=used_model, temperature=temperature)
     else:
         text = client.answer_with_meta(prompt, temperature=temperature)["text"]
 
@@ -96,7 +104,7 @@ def _ask_llm(provider: str, model: Optional[str], temperature: float, prompt: st
 class AskDetectBody(BaseModel):
     provider: str = "ollama"          # "ollama" | "openai"
     model: Optional[str] = None
-    temperature: float = 0.1
+    temperature: float = 0.7
     prompt: str
     fuzzy_threshold: float = 85.0
     brands: List[Brand]
@@ -105,7 +113,7 @@ class AskDetectBody(BaseModel):
 class AskDetectBatchBody(BaseModel):
     provider: str = "ollama"
     model: Optional[str] = None
-    temperature: float = 0.1
+    temperature: float = 0.7
     prompts: List[str]
     fuzzy_threshold: float = 85.0
     brands: List[Brand]
@@ -135,26 +143,97 @@ def ask_and_detect(body: AskDetectBody):
     }
 
 @router.post("/ask-detect-batch")
-def ask_and_detect_batch(body: AskDetectBatchBody):
+async def ask_and_detect_batch(body: AskDetectBatchBody):
     """
     ➜ N prompts (ex. 20) → détail par prompt + KPI agrégés par marque.
-    C’est l’endpoint à utiliser pour un audit GEO.
+    C'est l'endpoint à utiliser pour un audit GEO.
+    Maintenant optimisé avec traitement parallèle !
     """
+    import time
+    from backend.async_llm import process_llm_batch, optimize_request_batching
+
+    start_time = time.time()
     per_prompt: List[Dict[str, Any]] = []
 
-    for prompt_text in body.prompts:
-        answer_text, _used_model = _ask_llm(body.provider, body.model, body.temperature, prompt_text)
-        matches = detect(answer_text, brands=body.brands, fuzzy_threshold=body.fuzzy_threshold)
-        matches = _apply_match_mode(matches, body.match_mode)
-        summary = _summarize_matches(matches)
-        per_prompt.append({
-            "prompt": prompt_text,
-            "answer_text": answer_text,
-            "summary": summary,
-            "matches": [m.model_dump() for m in matches],
-        })
+    # Optimisation : traitement parallèle pour plusieurs prompts
+    if len(body.prompts) > 3:  # Seuil pour activer le parallélisme
+        print(f"🚀 Mode parallèle activé pour {len(body.prompts)} prompts")
 
+        # Préparer les requêtes pour le traitement parallèle
+        requests = optimize_request_batching(
+            body.prompts,
+            body.provider,
+            body.model,
+            body.temperature
+        )
+
+        # Traitement parallèle
+        batch_result = await process_llm_batch(requests)
+
+        # Traiter les résultats
+        for i, prompt_text in enumerate(body.prompts):
+            # Trouver le résultat correspondant
+            result = next((r for r in batch_result["results"] if r["index"] == i), None)
+
+            if result and not result["error"]:
+                answer_text = result["response"]
+                matches = detect(answer_text, brands=body.brands, fuzzy_threshold=body.fuzzy_threshold)
+                matches = _apply_match_mode(matches, body.match_mode)
+                summary = _summarize_matches(matches)
+                per_prompt.append({
+                    "prompt": prompt_text,
+                    "answer_text": answer_text,
+                    "summary": summary,
+                    "matches": [m.model_dump() for m in matches],
+                    "execution_time": result["execution_time"]
+                })
+            else:
+                # Gestion d'erreur
+                error_msg = result["response"] if result else "Erreur inconnue"
+                per_prompt.append({
+                    "prompt": prompt_text,
+                    "answer_text": f"Erreur: {error_msg}",
+                    "summary": {},
+                    "matches": [],
+                    "execution_time": result["execution_time"] if result else 0,
+                    "error": True
+                })
+
+        processing_metrics = batch_result["metrics"]
+    else:
+        # Mode séquentiel pour petits batches
+        print(f"🔄 Mode séquentiel pour {len(body.prompts)} prompts")
+        processing_metrics = {
+            "mode": "sequential",
+            "total_requests": len(body.prompts),
+            "parallel_efficiency": 0
+        }
+
+        for prompt_text in body.prompts:
+            prompt_start = time.time()
+            answer_text, _used_model = _ask_llm(body.provider, body.model, body.temperature, prompt_text)
+            matches = detect(answer_text, brands=body.brands, fuzzy_threshold=body.fuzzy_threshold)
+            matches = _apply_match_mode(matches, body.match_mode)
+            summary = _summarize_matches(matches)
+            per_prompt.append({
+                "prompt": prompt_text,
+                "answer_text": answer_text,
+                "summary": summary,
+                "matches": [m.model_dump() for m in matches],
+                "execution_time": time.time() - prompt_start
+            })
+
+    total_time = time.time() - start_time
     metrics = _aggregate_batch([item["summary"] for item in per_prompt])
+
+    # Ajouter les métriques de performance
+    metrics["performance"] = {
+        "total_execution_time": total_time,
+        "processing_mode": "parallel" if len(body.prompts) > 3 else "sequential",
+        "prompts_per_second": len(body.prompts) / total_time if total_time > 0 else 0,
+        **processing_metrics
+    }
+
     return {"per_prompt": per_prompt, "metrics": metrics}
 
 @router.post("/generate-prompts")
@@ -223,55 +302,55 @@ def generate_prompts_for_sector(
     # Templates spécialisés par secteur
     sector_templates = {
         "restaurant": [
-            f"Meilleurs restaurants {location_phrase}",
-            f"Où manger {location_phrase}",
-            f"Restaurant gastronomique {location_phrase}",
-            f"Bonne table {location_phrase}",
-            f"Cuisine locale {location_phrase}",
-            f"Restaurant traditionnel {location_phrase}",
-            f"Dîner romantique {location_phrase}",
-            f"Menu du jour {location_phrase}",
-            f"Restaurant familial {location_phrase}",
-            f"Spécialités culinaires {location_phrase}",
-            f"Brunch {location_phrase}",
-            f"Restaurant étoilé {location_phrase}",
-            f"Bistrot authentique {location_phrase}",
-            f"Cuisine du monde {location_phrase}",
-            f"Restaurant végétarien {location_phrase}"
+            f"Voici les restaurants {location_phrase} avec leurs adresses : [listez 10-15 restaurants avec nom, adresse complète, type de cuisine]",
+            f"Les meilleurs restaurants {location_phrase} : [donnez une liste concrète avec noms, adresses, spécialités]",
+            f"Restaurants recommandés {location_phrase} avec coordonnées : [listez précisément les établissements]",
+            f"Tous les restaurants {location_phrase} avec horaires et téléphones : [fournissez la liste détaillée]",
+            f"Annuaire restaurants {location_phrase} : [noms, adresses, spécialités, contacts - liste concrète]",
+            f"Établissements de restauration {location_phrase} : [recensement avec noms et adresses]",
+            f"Bonnes tables {location_phrase} : [inventaire détaillé avec coordonnées complètes]",
+            f"Restaurants {location_phrase} avec contact : [compilation adresses, téléphones, horaires]",
+            f"Restaurants gastronomiques {location_phrase} : [listez avec informations précises]",
+            f"Tous restaurants {location_phrase} : [énumérez avec nom, adresse, téléphone, spécialité]",
+            f"Guide restaurants {location_phrase} : [coordonnées et informations pratiques]",
+            f"Établissements culinaires {location_phrase} : [registre avec détails de contact]",
+            f"Index restaurants {location_phrase} : [noms complets, adresses exactes, numéros]",
+            f"Répertoire restaurants {location_phrase} : [toutes coordonnées disponibles]",
+            f"Base restaurants {location_phrase} : [informations complètes et actuelles]"
         ],
         "restaurant-vegan": [
-            f"Restaurant vegan {location_phrase}",
-            f"Cuisine végétalienne {location_phrase}",
-            f"Restaurant végétarien {location_phrase}",
-            f"Plats végétaux {location_phrase}",
-            f"Menu vegan {location_phrase}",
-            f"Repas sans viande {location_phrase}",
-            f"Cuisine bio {location_phrase}",
-            f"Healthy food {location_phrase}",
-            f"Buddha bowl {location_phrase}",
-            f"Smoothie bowl {location_phrase}",
-            f"Tofu {location_phrase}",
-            f"Quinoa {location_phrase}",
-            f"Légumes bio {location_phrase}",
-            f"Raw food {location_phrase}",
-            f"Cuisine sans gluten {location_phrase}"
+            f"Liste complète des restaurants végans {location_phrase} avec adresses et horaires",
+            f"Répertoire détaillé des restaurants végétariens {location_phrase} : noms, contacts, menus",
+            f"Annuaire complet cuisine végétalienne {location_phrase} avec coordonnées exactes",
+            f"Inventaire restaurants bio végans {location_phrase} : adresses, téléphones, spécialités",
+            f"Catalogue des établissements healthy food {location_phrase} avec informations complètes",
+            f"Liste précise des restaurants sans viande {location_phrase} : coordonnées et horaires",
+            f"Répertoire cuisine plant-based {location_phrase} avec adresses et contacts",
+            f"Annuaire restaurants raw food {location_phrase} : noms, emplacements, téléphones",
+            f"Index détaillé des restaurants sans gluten {location_phrase} avec coordonnées",
+            f"Compilation restaurants végétaliens {location_phrase} : adresses exactes et horaires",
+            f"Registre complet cuisine vegan {location_phrase} avec contacts et spécialités",
+            f"Base de données restaurants bio {location_phrase} : informations pratiques complètes",
+            f"Énumération restaurants healthy {location_phrase} avec adresses et numéros",
+            f"Répertoire officiel cuisine végétale {location_phrase} : coordonnées et horaires",
+            f"Listage exhaustif restaurants végans {location_phrase} avec toutes infos pratiques"
         ],
         "boulangerie": [
-            f"Boulangerie artisanale {location_phrase}",
-            f"Pain frais {location_phrase}",
-            f"Croissants {location_phrase}",
-            f"Pâtisserie {location_phrase}",
-            f"Viennoiseries {location_phrase}",
-            f"Baguette tradition {location_phrase}",
-            f"Gâteaux sur mesure {location_phrase}",
-            f"Pain bio {location_phrase}",
-            f"Macarons {location_phrase}",
-            f"Tarte aux fruits {location_phrase}",
-            f"Petit déjeuner {location_phrase}",
-            f"Sandwich frais {location_phrase}",
-            f"Éclair au chocolat {location_phrase}",
-            f"Paris-Brest {location_phrase}",
-            f"Mille-feuille {location_phrase}"
+            f"Liste complète des boulangeries {location_phrase} avec adresses et horaires d'ouverture",
+            f"Répertoire détaillé des boulangeries artisanales {location_phrase} : noms, contacts, spécialités",
+            f"Annuaire complet pâtisseries {location_phrase} avec coordonnées exactes et téléphones",
+            f"Inventaire des boulangeries {location_phrase} : adresses précises, horaires, pain frais",
+            f"Catalogue des établissements boulangerie-pâtisserie {location_phrase} avec informations complètes",
+            f"Liste précise des artisans boulangers {location_phrase} : coordonnées et spécialités",
+            f"Répertoire boulangeries traditionnelles {location_phrase} avec adresses et contacts",
+            f"Annuaire des pâtissiers {location_phrase} : noms, emplacements, téléphones, gâteaux",
+            f"Index détaillé des boulangeries bio {location_phrase} avec coordonnées complètes",
+            f"Compilation boulangeries {location_phrase} : adresses exactes, horaires, viennoiseries",
+            f"Registre complet des artisans du pain {location_phrase} avec contacts et produits",
+            f"Base de données boulangeries {location_phrase} : informations pratiques et spécialités",
+            f"Énumération des pâtisseries {location_phrase} avec adresses et numéros de téléphone",
+            f"Répertoire officiel boulangeries {location_phrase} : coordonnées et horaires complets",
+            f"Listage exhaustif boulangeries-pâtisseries {location_phrase} avec toutes infos pratiques"
         ],
         "coiffeur": [
             f"Coiffeur professionnel {location_phrase}",
@@ -325,13 +404,13 @@ def generate_prompts_for_sector(
             f"Stomatologue {location_phrase}"
         ],
         "avocat": [
-            f"Avocat {location_phrase}",
-            f"Cabinet d'avocats {location_phrase}",
+            f"Liste des avocats {location_phrase}",
+            f"Annuaire cabinets d'avocats {location_phrase}",
+            f"Avocats recommandés {location_phrase}",
             f"Conseil juridique {location_phrase}",
-            f"Avocat divorce {location_phrase}",
-            f"Droit du travail {location_phrase}",
-            f"Avocat immobilier {location_phrase}",
-            f"Contentieux {location_phrase}",
+            f"Répertoire avocats {location_phrase}",
+            f"Cabinets juridiques {location_phrase}",
+            f"Avocats spécialisés {location_phrase}",
             f"Avocat pénal {location_phrase}",
             f"Droit de la famille {location_phrase}",
             f"Succession {location_phrase}",
@@ -459,6 +538,57 @@ def generate_prompts_for_sector(
             f"Intervention {location_phrase}",
             f"Dépannage {location_phrase}",
             f"Service à domicile {location_phrase}"
+        ],
+        "comptable": [
+            f"Liste complète des cabinets comptables {location_phrase} avec adresses et contacts",
+            f"Répertoire détaillé des experts-comptables {location_phrase} : noms, téléphones, spécialités",
+            f"Annuaire complet des comptables {location_phrase} avec coordonnées exactes",
+            f"Inventaire des cabinets d'expertise comptable {location_phrase} : adresses, horaires, services",
+            f"Catalogue des professionnels comptables {location_phrase} avec informations complètes",
+            f"Liste précise des experts-comptables agréés {location_phrase} : coordonnées et domaines",
+            f"Répertoire cabinets comptabilité {location_phrase} avec adresses et contacts directs",
+            f"Annuaire des comptables libéraux {location_phrase} : noms, emplacements, téléphones",
+            f"Index détaillé des conseillers fiscaux {location_phrase} avec coordonnées complètes",
+            f"Compilation experts-comptables {location_phrase} : adresses exactes, services, tarifs",
+            f"Registre complet des professionnels comptables {location_phrase} avec contacts",
+            f"Base de données cabinets comptables {location_phrase} : informations pratiques complètes",
+            f"Énumération des comptables {location_phrase} avec adresses et numéros professionnels",
+            f"Répertoire officiel experts-comptables {location_phrase} : coordonnées et spécialisations",
+            f"Listage exhaustif cabinets comptabilité {location_phrase} avec toutes infos pratiques"
+        ],
+        "business-school": [
+            f"Liste complète des écoles de commerce {location_phrase} avec adresses et programmes",
+            f"Répertoire détaillé des business schools {location_phrase} : noms, contacts, formations",
+            f"Annuaire complet des écoles de management {location_phrase} avec coordonnées exactes",
+            f"Inventaire des établissements business school {location_phrase} : adresses, cursus, admissions",
+            f"Catalogue des écoles supérieure de commerce {location_phrase} avec informations complètes",
+            f"Liste précise des business schools reconnues {location_phrase} : coordonnées et programmes",
+            f"Répertoire écoles de commerce {location_phrase} avec adresses et contacts directs",
+            f"Annuaire des MBA programs {location_phrase} : noms, emplacements, téléphones",
+            f"Index détaillé des grandes écoles commerce {location_phrase} avec coordonnées complètes",
+            f"Compilation business schools {location_phrase} : adresses exactes, formations, classements",
+            f"Registre complet des écoles management {location_phrase} avec contacts et programmes",
+            f"Base de données business schools {location_phrase} : informations pratiques et admissions",
+            f"Énumération des écoles commerce {location_phrase} avec adresses et numéros d'information",
+            f"Répertoire officiel business schools {location_phrase} : coordonnées et spécialisations",
+            f"Listage exhaustif écoles de commerce {location_phrase} avec toutes infos pratiques"
+        ],
+        "ecole": [
+            f"Liste complète des écoles {location_phrase} avec adresses et contacts administratifs",
+            f"Répertoire détaillé des établissements scolaires {location_phrase} : noms, téléphones, niveaux",
+            f"Annuaire complet des écoles {location_phrase} avec coordonnées exactes et horaires",
+            f"Inventaire des institutions éducatives {location_phrase} : adresses, programmes, inscriptions",
+            f"Catalogue des établissements d'enseignement {location_phrase} avec informations complètes",
+            f"Liste précise des écoles publiques et privées {location_phrase} : coordonnées et spécialités",
+            f"Répertoire établissements scolaires {location_phrase} avec adresses et contacts directs",
+            f"Annuaire des centres de formation {location_phrase} : noms, emplacements, téléphones",
+            f"Index détaillé des institutions éducatives {location_phrase} avec coordonnées complètes",
+            f"Compilation écoles {location_phrase} : adresses exactes, niveaux, programmes pédagogiques",
+            f"Registre complet des établissements d'enseignement {location_phrase} avec contacts",
+            f"Base de données écoles {location_phrase} : informations pratiques et modalités d'inscription",
+            f"Énumération des institutions scolaires {location_phrase} avec adresses et numéros",
+            f"Répertoire officiel des écoles {location_phrase} : coordonnées et spécialisations",
+            f"Listage exhaustif établissements éducatifs {location_phrase} avec toutes infos pratiques"
         ]
     }
 
@@ -535,4 +665,70 @@ def generate_prompts_for_sector(
         "location": location,
         "count": len(generated_prompts[:count]),
         "sector_specialized": business_type in sector_templates
+    }
+
+
+# === ENDPOINTS DE PERFORMANCE ET STATISTIQUES ===
+
+@router.get("/cache/stats")
+def get_cache_stats():
+    """Retourne les statistiques du cache pour monitoring"""
+    stats = cache.stats()
+    return {
+        "cache": stats,
+        "status": "healthy" if stats["active_entries"] > 0 else "empty"
+    }
+
+@router.post("/cache/clear")
+def clear_cache():
+    """Vide le cache (utile pour debug/maintenance)"""
+    cache.clear()
+    return {"message": "Cache vidé avec succès"}
+
+@router.post("/cache/cleanup")
+def cleanup_cache():
+    """Nettoie les entrées expirées du cache"""
+    from backend.cache import schedule_cache_cleanup
+    cleaned = schedule_cache_cleanup()
+    return {"message": f"{cleaned} entrées expirées supprimées"}
+
+@router.post("/reset-circuit-breaker/{provider}")
+def reset_circuit_breaker_endpoint(provider: str):
+    """Reset un circuit breaker pour un provider donné"""
+    from backend.error_handler import reset_circuit_breaker
+
+    success = reset_circuit_breaker(provider)
+    if success:
+        return {"message": f"Circuit breaker {provider} remis à zéro avec succès", "provider": provider}
+    else:
+        raise HTTPException(status_code=404, detail=f"Provider {provider} non trouvé")
+
+@router.get("/health/detailed")
+def detailed_health_check():
+    """Health check détaillé avec métriques de performance"""
+    from src.geo_agent.models import get_llm_client
+    from backend.error_handler import get_error_stats
+    import time
+
+    start_time = time.time()
+
+    # Test basique des providers
+    providers_status = {}
+    for provider in ["openai", "ollama", "gemini", "perplexity"]:
+        try:
+            client = get_llm_client(provider)
+            providers_status[provider] = {"status": "available", "error": None}
+        except Exception as e:
+            providers_status[provider] = {"status": "error", "error": str(e)}
+
+    response_time = time.time() - start_time
+    cache_stats = cache.stats()
+
+    return {
+        "status": "healthy",
+        "response_time_ms": round(response_time * 1000, 2),
+        "providers": providers_status,
+        "cache": cache_stats,
+        "error_stats": get_error_stats(),
+        "timestamp": time.time()
     }

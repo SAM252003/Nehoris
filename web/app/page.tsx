@@ -2,12 +2,15 @@
 
 import { useState, useEffect } from "react";
 import { askDetectBatch, generatePrompts } from "@/lib/api";
+import { useDebounce, useDebouncedCallback } from "@/hooks/useDebounce";
+import { useWebSocket } from "@/hooks/useWebSocket";
+import { ErrorBoundary, OptimizedResultCard, ResultSkeleton } from "@/components/OptimizedContent";
 
 type Brand = { name: string; aliases?: string[] };
 
 export default function AuditPage() {
   const [provider, setProvider] = useState<"openai" | "anthropic" | "gemini" | "ollama" | "perplexity">("openai");
-  const [model, setModel] = useState("gpt-5-mini");
+  const [model, setModel] = useState("gpt-5");
   const [brandName, setBrandName] = useState("Seven Seventy");
   const [brandAliases, setBrandAliases] = useState("770, seven seventy");
   const [businessType, setBusinessType] = useState("restaurant");
@@ -24,6 +27,31 @@ export default function AuditPage() {
   const [results, setResults] = useState<any>(null);
   const [comparisonResults, setComparisonResults] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
+  const [streamingProgress, setStreamingProgress] = useState<any>(null);
+
+  // Optimisation avec debounce pour la génération automatique de prompts
+  const debouncedBusinessType = useDebounce(businessType, 500);
+  const debouncedLocation = useDebounce(location, 500);
+
+  // WebSocket pour le streaming en temps réel
+  const { sendMessage, lastMessage, isOpen, connectionError } = useWebSocket(
+    `ws://localhost:8001/ws/audit/streaming-${Date.now()}`,
+    {
+      onMessage: (data) => {
+        if (data.type === 'progress_update') {
+          setStreamingProgress(data);
+        } else if (data.type === 'audit_completed') {
+          setResults(data.results);
+          setLoading(false);
+          setStreamingProgress(null);
+        } else if (data.type === 'error') {
+          setError(data.error);
+          setLoading(false);
+          setStreamingProgress(null);
+        }
+      }
+    }
+  );
 
   // Charger les données sauvegardées au démarrage
   useEffect(() => {
