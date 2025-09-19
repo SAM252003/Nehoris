@@ -161,60 +161,365 @@ def ask_and_detect_batch(body: AskDetectBatchBody):
 def generate_prompts_for_sector(
     business_type: str = Body(..., description="Type d'activité (ex: 'restaurant', 'banque', 'artisan')"),
     location: str = Body("", description="Localisation (ex: 'Paris', 'Marseille')"),
-    count: int = Body(20, description="Nombre de prompts à générer")
+    count: int = Body(20, description="Nombre de prompts à générer"),
+    keywords: str = Body("", description="Mots-clés spécifiques séparés par virgules (ex: 'bio, local, artisanal')")
 ):
     """
-    Génère automatiquement des prompts universels pour n'importe quel type d'entreprise
+    Génère automatiquement des prompts spécialisés par secteur d'activité
     """
 
-    # Préparation de la localisation
-    location_phrase = f"à {location}" if location else ""
-    location_phrase_dans = f"dans {location}" if location else ""
-    location_phrase_pres = f"près de {location}" if location else ""
+    # Fonction pour gérer les prépositions françaises correctement
+    def get_location_phrase(location: str, preposition_type: str = "à") -> str:
+        if not location:
+            return ""
 
-    # Template de base universel
-    base_prompt = f"Générer moi une liste de {business_type} {location_phrase}"
+        location_lower = location.lower()
 
-    # Variations du prompt de base
-    prompt_variations = [
+        # Pays (utilisent "en" ou "au")
+        pays_en = ["france", "italie", "espagne", "allemagne", "angleterre", "suisse", "belgique", "norvège", "suède", "finlande", "pologne", "hongrie", "autriche", "grèce", "turquie", "russie", "chine", "inde", "corée", "australie"]
+        pays_au = ["canada", "japon", "brésil", "mexique", "maroc", "portugal", "danemark", "luxembourg", "royaume-uni", "pays-bas"]
+        pays_aux = ["états-unis", "philippines", "émirats arabes unis", "pays-bas"]
+
+        # Continents (utilisent "en")
+        continents = ["europe", "asie", "afrique", "amérique", "océanie", "amérique du nord", "amérique du sud"]
+
+        # Régions françaises (utilisent "en")
+        regions = ["provence", "bretagne", "normandie", "alsace", "bourgogne", "champagne", "loire", "dordogne", "ardèche", "savoie", "haute-savoie", "ile-de-france", "nouvelle-aquitaine", "occitanie", "auvergne-rhône-alpes", "grand est", "hauts-de-france", "pays de la loire", "centre-val de loire", "bourgogne-franche-comté", "paca", "corse"]
+
+        if preposition_type == "à":
+            if location_lower in pays_en or location_lower in continents or location_lower in regions:
+                return f"en {location}"
+            elif location_lower in pays_au:
+                return f"au {location}"
+            elif location_lower in pays_aux:
+                return f"aux {location}"
+            elif location_lower == "monde":
+                return "dans le monde"
+            else:
+                return f"à {location}"
+
+        elif preposition_type == "dans":
+            if location_lower in pays_en or location_lower in continents or location_lower in regions:
+                return f"en {location}"
+            elif location_lower in pays_au:
+                return f"au {location}"
+            elif location_lower in pays_aux:
+                return f"aux {location}"
+            elif location_lower == "monde":
+                return "dans le monde"
+            else:
+                return f"dans {location}"
+
+        elif preposition_type == "près":
+            return f"près de {location}"
+
+        return f"à {location}"
+
+    # Préparation des différentes variantes de localisation
+    location_phrase = get_location_phrase(location, "à")
+    location_phrase_dans = get_location_phrase(location, "dans")
+    location_phrase_pres = get_location_phrase(location, "près")
+
+    # Templates spécialisés par secteur
+    sector_templates = {
+        "restaurant": [
+            f"Meilleurs restaurants {location_phrase}",
+            f"Où manger {location_phrase}",
+            f"Restaurant gastronomique {location_phrase}",
+            f"Bonne table {location_phrase}",
+            f"Cuisine locale {location_phrase}",
+            f"Restaurant traditionnel {location_phrase}",
+            f"Dîner romantique {location_phrase}",
+            f"Menu du jour {location_phrase}",
+            f"Restaurant familial {location_phrase}",
+            f"Spécialités culinaires {location_phrase}",
+            f"Brunch {location_phrase}",
+            f"Restaurant étoilé {location_phrase}",
+            f"Bistrot authentique {location_phrase}",
+            f"Cuisine du monde {location_phrase}",
+            f"Restaurant végétarien {location_phrase}"
+        ],
+        "restaurant-vegan": [
+            f"Restaurant vegan {location_phrase}",
+            f"Cuisine végétalienne {location_phrase}",
+            f"Restaurant végétarien {location_phrase}",
+            f"Plats végétaux {location_phrase}",
+            f"Menu vegan {location_phrase}",
+            f"Repas sans viande {location_phrase}",
+            f"Cuisine bio {location_phrase}",
+            f"Healthy food {location_phrase}",
+            f"Buddha bowl {location_phrase}",
+            f"Smoothie bowl {location_phrase}",
+            f"Tofu {location_phrase}",
+            f"Quinoa {location_phrase}",
+            f"Légumes bio {location_phrase}",
+            f"Raw food {location_phrase}",
+            f"Cuisine sans gluten {location_phrase}"
+        ],
+        "boulangerie": [
+            f"Boulangerie artisanale {location_phrase}",
+            f"Pain frais {location_phrase}",
+            f"Croissants {location_phrase}",
+            f"Pâtisserie {location_phrase}",
+            f"Viennoiseries {location_phrase}",
+            f"Baguette tradition {location_phrase}",
+            f"Gâteaux sur mesure {location_phrase}",
+            f"Pain bio {location_phrase}",
+            f"Macarons {location_phrase}",
+            f"Tarte aux fruits {location_phrase}",
+            f"Petit déjeuner {location_phrase}",
+            f"Sandwich frais {location_phrase}",
+            f"Éclair au chocolat {location_phrase}",
+            f"Paris-Brest {location_phrase}",
+            f"Mille-feuille {location_phrase}"
+        ],
+        "coiffeur": [
+            f"Coiffeur professionnel {location_phrase}",
+            f"Salon de coiffure {location_phrase}",
+            f"Coupe moderne {location_phrase}",
+            f"Coloration cheveux {location_phrase}",
+            f"Brushing {location_phrase}",
+            f"Coiffure mariage {location_phrase}",
+            f"Balayage {location_phrase}",
+            f"Lissage brésilien {location_phrase}",
+            f"Coiffeur homme {location_phrase}",
+            f"Extensions cheveux {location_phrase}",
+            f"Permanente {location_phrase}",
+            f"Coiffure enfant {location_phrase}",
+            f"Shampooing soin {location_phrase}",
+            f"Mèches {location_phrase}",
+            f"Relooking capillaire {location_phrase}"
+        ],
+        "garage": [
+            f"Garage automobile {location_phrase}",
+            f"Réparation voiture {location_phrase}",
+            f"Mécanicien {location_phrase}",
+            f"Entretien véhicule {location_phrase}",
+            f"Contrôle technique {location_phrase}",
+            f"Vidange {location_phrase}",
+            f"Pneus {location_phrase}",
+            f"Diagnostic auto {location_phrase}",
+            f"Carrosserie {location_phrase}",
+            f"Révision voiture {location_phrase}",
+            f"Freins {location_phrase}",
+            f"Embrayage {location_phrase}",
+            f"Climatisation auto {location_phrase}",
+            f"Batterie voiture {location_phrase}",
+            f"Dépannage auto {location_phrase}"
+        ],
+        "dentiste": [
+            f"Dentiste {location_phrase}",
+            f"Cabinet dentaire {location_phrase}",
+            f"Orthodontiste {location_phrase}",
+            f"Implants dentaires {location_phrase}",
+            f"Urgence dentaire {location_phrase}",
+            f"Blanchiment dents {location_phrase}",
+            f"Détartrage {location_phrase}",
+            f"Prothèse dentaire {location_phrase}",
+            f"Chirurgien dentiste {location_phrase}",
+            f"Couronne dentaire {location_phrase}",
+            f"Extraction dent {location_phrase}",
+            f"Appareil dentaire {location_phrase}",
+            f"Parodontologie {location_phrase}",
+            f"Endodontie {location_phrase}",
+            f"Stomatologue {location_phrase}"
+        ],
+        "avocat": [
+            f"Avocat {location_phrase}",
+            f"Cabinet d'avocats {location_phrase}",
+            f"Conseil juridique {location_phrase}",
+            f"Avocat divorce {location_phrase}",
+            f"Droit du travail {location_phrase}",
+            f"Avocat immobilier {location_phrase}",
+            f"Contentieux {location_phrase}",
+            f"Avocat pénal {location_phrase}",
+            f"Droit de la famille {location_phrase}",
+            f"Succession {location_phrase}",
+            f"Avocat commercial {location_phrase}",
+            f"Aide juridictionnelle {location_phrase}",
+            f"Procédure {location_phrase}",
+            f"Consultation juridique {location_phrase}",
+            f"Avocat spécialisé {location_phrase}"
+        ],
+        "banque": [
+            f"Banque {location_phrase}",
+            f"Agence bancaire {location_phrase}",
+            f"Crédit immobilier {location_phrase}",
+            f"Prêt personnel {location_phrase}",
+            f"Compte bancaire {location_phrase}",
+            f"Conseiller financier {location_phrase}",
+            f"Placement {location_phrase}",
+            f"Assurance vie {location_phrase}",
+            f"Crédit auto {location_phrase}",
+            f"Livret épargne {location_phrase}",
+            f"Carte bancaire {location_phrase}",
+            f"Virement {location_phrase}",
+            f"Découvert {location_phrase}",
+            f"Investissement {location_phrase}",
+            f"Banque en ligne {location_phrase}"
+        ],
+        "hotel": [
+            f"Hôtel {location_phrase}",
+            f"Hébergement {location_phrase}",
+            f"Réservation hôtel {location_phrase}",
+            f"Chambre d'hôtel {location_phrase}",
+            f"Hôtel de luxe {location_phrase}",
+            f"Nuit d'hôtel {location_phrase}",
+            f"Hôtel spa {location_phrase}",
+            f"Auberge {location_phrase}",
+            f"Gîte {location_phrase}",
+            f"Maison d'hôtes {location_phrase}",
+            f"Hôtel restaurant {location_phrase}",
+            f"Suite {location_phrase}",
+            f"Petit déjeuner inclus {location_phrase}",
+            f"Hôtel centre ville {location_phrase}",
+            f"Escapade romantique {location_phrase}"
+        ],
+        "pharmacie": [
+            f"Pharmacie {location_phrase}",
+            f"Garde pharmacie {location_phrase}",
+            f"Médicaments {location_phrase}",
+            f"Ordonnance {location_phrase}",
+            f"Parapharmacie {location_phrase}",
+            f"Pharmacien {location_phrase}",
+            f"Homéopathie {location_phrase}",
+            f"Urgence pharmacie {location_phrase}",
+            f"Conseil santé {location_phrase}",
+            f"Vaccin {location_phrase}",
+            f"Cosmétiques {location_phrase}",
+            f"Matériel médical {location_phrase}",
+            f"Automédication {location_phrase}",
+            f"Pharmacie de nuit {location_phrase}",
+            f"Phytothérapie {location_phrase}"
+        ],
+        "immobilier": [
+            f"Agence immobilière {location_phrase}",
+            f"Vente appartement {location_phrase}",
+            f"Location maison {location_phrase}",
+            f"Agent immobilier {location_phrase}",
+            f"Estimation immobilière {location_phrase}",
+            f"Achat maison {location_phrase}",
+            f"Investissement locatif {location_phrase}",
+            f"Négociateur {location_phrase}",
+            f"Gestion locative {location_phrase}",
+            f"Mandat vente {location_phrase}",
+            f"Visite appartement {location_phrase}",
+            f"Syndic {location_phrase}",
+            f"Copropriété {location_phrase}",
+            f"Notaire {location_phrase}",
+            f"Crédit immobilier {location_phrase}"
+        ],
+        "artisan": [
+            f"Artisan {location_phrase}",
+            f"Travaux maison {location_phrase}",
+            f"Plombier {location_phrase}",
+            f"Électricien {location_phrase}",
+            f"Maçon {location_phrase}",
+            f"Peintre {location_phrase}",
+            f"Menuisier {location_phrase}",
+            f"Couvreur {location_phrase}",
+            f"Chauffagiste {location_phrase}",
+            f"Carreleur {location_phrase}",
+            f"Serrurier {location_phrase}",
+            f"Dépannage {location_phrase}",
+            f"Rénovation {location_phrase}",
+            f"Devis gratuit {location_phrase}",
+            f"Artisan qualifié {location_phrase}"
+        ],
+        "commerce": [
+            f"Magasin {location_phrase}",
+            f"Boutique {location_phrase}",
+            f"Commerce {location_phrase}",
+            f"Shopping {location_phrase}",
+            f"Vente {location_phrase}",
+            f"Promotion {location_phrase}",
+            f"Soldes {location_phrase}",
+            f"Livraison {location_phrase}",
+            f"Magasin spécialisé {location_phrase}",
+            f"Centre commercial {location_phrase}",
+            f"Achat local {location_phrase}",
+            f"Produits {location_phrase}",
+            f"Service client {location_phrase}",
+            f"Retrait magasin {location_phrase}",
+            f"Conseiller vente {location_phrase}"
+        ],
+        "service": [
+            f"Service professionnel {location_phrase}",
+            f"Prestation {location_phrase}",
+            f"Consultant {location_phrase}",
+            f"Expert {location_phrase}",
+            f"Accompagnement {location_phrase}",
+            f"Formation {location_phrase}",
+            f"Audit {location_phrase}",
+            f"Conseil {location_phrase}",
+            f"Maintenance {location_phrase}",
+            f"Support {location_phrase}",
+            f"Assistance {location_phrase}",
+            f"Diagnostic {location_phrase}",
+            f"Intervention {location_phrase}",
+            f"Dépannage {location_phrase}",
+            f"Service à domicile {location_phrase}"
+        ]
+    }
+
+    # Sélectionne les prompts spécialisés ou génériques
+    if business_type in sector_templates:
+        specialized_prompts = sector_templates[business_type]
+    else:
+        # Fallback générique pour les secteurs non listés
+        specialized_prompts = [
+            f"Meilleur {business_type} {location_phrase}",
+            f"{business_type.capitalize()} professionnel {location_phrase}",
+            f"Service {business_type} {location_phrase}",
+            f"Expert {business_type} {location_phrase}",
+            f"Spécialiste {business_type} {location_phrase}",
+            f"{business_type.capitalize()} recommandé {location_phrase}",
+            f"Bon {business_type} {location_phrase}",
+            f"{business_type.capitalize()} de qualité {location_phrase}",
+            f"Recherche {business_type} {location_phrase}",
+            f"Trouvez un {business_type} {location_phrase}",
+            f"Sélection {business_type} {location_phrase}",
+            f"Guide {business_type} {location_phrase}",
+            f"Annuaire {business_type} {location_phrase}",
+            f"Comparatif {business_type} {location_phrase}",
+            f"Avis {business_type} {location_phrase}"
+        ]
+
+    # Ajout de variations génériques pour compléter
+    generic_variations = [
         f"Liste des meilleurs {business_type} {location_phrase}",
-        f"Où trouver un bon {business_type} {location_phrase}",
+        f"Où trouver un {business_type} {location_phrase}",
         f"Recommandations {business_type} {location_phrase}",
-        f"Meilleur {business_type} {location_phrase}",
-        f"{business_type.capitalize()} recommandé {location_phrase}",
-        f"Bon {business_type} {location_phrase}",
-        f"{business_type.capitalize()} de qualité {location_phrase}",
-        f"Recherche {business_type} {location_phrase}",
         f"{business_type.capitalize()} proche {location}" if location else f"Proche {business_type}",
-        f"Sélection {business_type} {location_phrase}",
-        f"Guide {business_type} {location_phrase}",
-        f"Annuaire {business_type} {location_phrase}",
-        f"Trouvez un {business_type} {location_phrase}",
-        f"{business_type.capitalize()} dans la région {location}" if location else f"{business_type.capitalize()} dans la région",
-        f"Comparatif {business_type} {location_phrase}",
-        f"Avis {business_type} {location_phrase}",
         f"Top {business_type} {location_phrase}",
         f"{business_type.capitalize()} local {location_phrase}",
-        f"Service {business_type} {location_phrase}",
-        f"Professionnel {business_type} {location_phrase}"
-    ]
-
-    # Ajout de variations avec prépositions différentes
-    additional_variations = [
-        f"Liste de {business_type} {location_phrase_dans}",
-        f"Meilleurs {business_type} {location_phrase_pres}",
-        f"Où aller pour {business_type} {location_phrase}",
-        f"Cherche {business_type} {location_phrase}",
-        f"{business_type.capitalize()} réputé {location_phrase}",
         f"Adresse {business_type} {location_phrase}",
         f"Contact {business_type} {location_phrase}",
-        f"Spécialiste {business_type} {location_phrase}",
-        f"Expert {business_type} {location_phrase}",
-        f"{business_type.capitalize()} professionnel {location_phrase}"
+        f"{business_type.capitalize()} réputé {location_phrase}",
+        f"{business_type.capitalize()} dans la région {location}" if location else f"{business_type.capitalize()} dans la région"
     ]
 
-    # Combine toutes les variations
-    all_prompts = prompt_variations + additional_variations
+    # Combine spécialisés + génériques
+    all_prompts = specialized_prompts + generic_variations
+
+    # Traitement des mots-clés spécifiques
+    if keywords.strip():
+        keyword_list = [kw.strip() for kw in keywords.split(",") if kw.strip()]
+        keyword_prompts = []
+
+        for keyword in keyword_list:
+            # Génère des prompts enrichis avec chaque mot-clé
+            keyword_prompts.extend([
+                f"{business_type.capitalize()} {keyword} {location_phrase}",
+                f"Meilleur {business_type} {keyword} {location_phrase}",
+                f"Où trouver {business_type} {keyword} {location_phrase}",
+                f"{keyword.capitalize()} {business_type} {location_phrase}",
+                f"Restaurant {keyword} {location_phrase}" if business_type.startswith("restaurant") else f"{business_type} {keyword} {location_phrase}",
+                f"Spécialiste {business_type} {keyword} {location_phrase}"
+            ])
+
+        # Priorité aux prompts avec mots-clés, puis compléter avec les autres
+        all_prompts = keyword_prompts + all_prompts
 
     # Sélectionne et limite au nombre demandé
     generated_prompts = all_prompts[:count]
@@ -222,11 +527,12 @@ def generate_prompts_for_sector(
     # Si on n'a pas assez, on répète les meilleurs
     while len(generated_prompts) < count:
         remaining_needed = count - len(generated_prompts)
-        generated_prompts.extend(prompt_variations[:remaining_needed])
+        generated_prompts.extend(specialized_prompts[:remaining_needed])
 
     return {
         "prompts": generated_prompts[:count],
         "business_type": business_type,
         "location": location,
-        "count": len(generated_prompts[:count])
+        "count": len(generated_prompts[:count]),
+        "sector_specialized": business_type in sector_templates
     }

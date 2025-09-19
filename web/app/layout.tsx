@@ -15,6 +15,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 <Link href="/" className="px-4 py-2 bg-blue-600 text-white rounded-lg shadow hover:shadow-md">
                   Audit GEO
                 </Link>
+                <Link href="/analytics" className="px-4 py-2 bg-purple-600 text-white rounded-lg shadow hover:shadow-md">
+                  📊 Analytics
+                </Link>
+                <Link href="/history" className="px-4 py-2 bg-green-600 text-white rounded-lg shadow hover:shadow-md">
+                  📈 Historique
+                </Link>
               </nav>
             </div>
           </header>
